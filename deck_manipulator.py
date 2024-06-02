@@ -2,13 +2,14 @@ import os
 import sqlite3
 from zipfile import ZipFile
 from deep_translator import GoogleTranslator
-from requests.exceptions import ProxyError, ConnectTimeout
 from deep_translator.exceptions import TranslationNotFound, TooManyRequests
+from requests.exceptions import ProxyError, ConnectTimeout
 from tqdm import tqdm
 from proxy_dealer import ProxyDealer
 import logging
 import asyncio
 import aiohttp
+import json
 
 class DeckManipulator:
 
@@ -19,6 +20,7 @@ class DeckManipulator:
         proxy_dealer = ProxyDealer()
         self.proxies = proxy_dealer.get_proxies()
         logging.basicConfig(filename='deck_manipulator.log', level=logging.INFO)
+        self.field_names = ["tradução", "significado"]
 
     def extract_apkg(self, apkg_file, extract_to):
         with ZipFile(apkg_file, 'r') as zip_ref:
@@ -50,50 +52,62 @@ class DeckManipulator:
         conn = sqlite3.connect(db_path)
         return conn, conn.cursor()
 
-    async def translate_text(self, session, text):
-        for proxy in self.proxies:
-            try:
-                translated = GoogleTranslator(source='en', target='pt', proxies={'http': proxy, 'https': proxy}).translate(text)
-                return translated
-            except (TranslationNotFound, TooManyRequests, ProxyError, ConnectTimeout) as e:
-                logging.error(f"Erro com o proxy {proxy}: {e}")
-            except Exception as e:
-                logging.error(f"Erro inesperado com o proxy {proxy}: {e}")
-        print("Todos os proxies falharam.")
-        return None
+    async def translate_text(self, text):
+        async with aiohttp.ClientSession() as session:
+            for proxy in self.proxies:
+                try:
+                    translator = GoogleTranslator(source='en', target='pt', proxies=proxy)
+                    translated = translator.translate(text)
+                    return translated
+                except (TranslationNotFound, TooManyRequests, ProxyError, ConnectTimeout) as e:
+                    logging.error(f"Erro com o proxy {proxy}: {e}")
+                except Exception as e:
+                    logging.error(f"Erro inesperado com o proxy {proxy}: {e}")
+        print("Todos os proxies falharam. Aguardando antes de tentar novamente, 60 segundos de espera...")
+        await asyncio.sleep(60)  # Espera por 60 segundos antes de tentar novamente
+        return await self.translate_text(text)
+    
+    def get_field_index(self, cursor, field_names):
+        cursor.execute("SELECT models FROM col")
+        models_json = json.loads(cursor.fetchone()[0])  # Carregar o JSON corretamente
+        indices = {}
+        for model_id, model_data in models_json.items():
+            for field in model_data['flds']:
+                if field['name'] in field_names:
+                    indices[field['name']] = model_data['flds'].index(field)
+        if not indices:
+            raise ValueError(f"Field '{field_names}' not found.")
+        return indices
 
-    async def manipulate_fields(self, conn, cursor):
+    async def manipulate_fields(self, conn, cursor, file_name=""):
+        
+        # It's a dictionary {'field_name': index-number}
+        field_names = self.get_field_index(cursor, self.field_names)
         cursor.execute("SELECT id, flds FROM notes")
         notes = cursor.fetchall()
-        async with aiohttp.ClientSession() as session:
-            for note_id, flds in tqdm(notes, desc="Traduzindo campos"):
-                fields = flds.split('\x1f')
-                if len(fields) > 2:
-                    translated_text = await self.translate_text(session, fields[2])
-                    if translated_text:
-                        fields[2] = translated_text
-                new_flds = '\x1f'.join(fields)
-                cursor.execute("UPDATE notes SET flds = ? WHERE id = ?", (new_flds, note_id))
+
+        for note_id, flds in tqdm(notes, desc=f"Translating fields {file_name}"):
+            fields = flds.split('\x1f')
+            # That crucial we need to check if the index in the list correspond to the index that we want to change
+            for field_name, index in field_names.items():
+                translated_field = await self.translate_text(fields[index])
+                fields[index] = translated_field
+            new_flds = '\x1f'.join(fields)
+            cursor.execute("UPDATE notes SET flds = ? WHERE id = ?", (new_flds, note_id))
         conn.commit()
-        conn.close()
-
-    async def process_deck(self, deck):
-        deck_file_name = os.path.basename(deck)
-        output_file = os.path.join(self.destiny_path, deck_file_name)
-
-        self.extract_apkg(deck, self.temp_file)
-        conn, cursor = self.connect_to_database(self.temp_file)
-        await self.manipulate_fields(conn, cursor)
-        self.create_apkg(self.temp_file, output_file)
-        self.remove_temporary_files(self.temp_file)
 
     async def run(self):
         decks = self.list_decks()
-        if decks:
-            tasks = [self.process_deck(deck) for deck in decks]
-            await asyncio.gather(*tasks)
-        else:
-            raise Exception("No deck .apkg file was provided")
+        for deck in decks:
+            deck_file_name = os.path.basename(deck)
+            output_file = os.path.join(self.destiny_path, deck_file_name)
+
+            self.extract_apkg(deck, self.temp_file)
+            conn, cursor = self.connect_to_database(self.temp_file)
+            await self.manipulate_fields(conn, cursor, deck_file_name)
+            self.create_apkg(self.temp_file, output_file)
+            self.remove_temporary_files(self.temp_file)
+            conn.close()
 
 if __name__ == "__main__":
     deck_manipulator = DeckManipulator()

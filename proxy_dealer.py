@@ -64,3 +64,6 @@ class ProxyDealer():
             raise Exception("None of the proxies in the list work")
 
 
+# test = ProxyDealer()
+# print(test.get_proxies())
+
