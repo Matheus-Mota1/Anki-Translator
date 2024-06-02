@@ -1,0 +1,10 @@
+sqlite3
+zipfile
+deep_translator
+requests
+tqdm
+logging
+asyncio
+aiohttp
+json
+

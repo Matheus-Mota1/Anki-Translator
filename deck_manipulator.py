@@ -60,38 +60,55 @@ class DeckManipulator:
                     translated = translator.translate(text)
                     return translated
                 except (TranslationNotFound, TooManyRequests, ProxyError, ConnectTimeout) as e:
-                    logging.error(f"Erro com o proxy {proxy}: {e}")
+                    logging.error(f"Error with proxy: {proxy}: {e}")
                 except Exception as e:
-                    logging.error(f"Erro inesperado com o proxy {proxy}: {e}")
-        print("Todos os proxies falharam. Aguardando antes de tentar novamente, 60 segundos de espera...")
-        await asyncio.sleep(60)  # Espera por 60 segundos antes de tentar novamente
+                    logging.error(f"Unexpected error with proxy: {proxy}: {e}")
+        print("All the proxies failed, please wait 60 seconds, and the programm will continue...")
+        await asyncio.sleep(60)
         return await self.translate_text(text)
     
-    def get_field_index(self, cursor, field_names):
+    def get_field_indices(self, cursor):
         cursor.execute("SELECT models FROM col")
-        models_json = json.loads(cursor.fetchone()[0])  # Carregar o JSON corretamente
-        indices = {}
+        models_json = json.loads(cursor.fetchone()[0])
+        field_indices = {}
+
         for model_id, model_data in models_json.items():
+            indices = {}
             for field in model_data['flds']:
-                if field['name'] in field_names:
+                # If the field name is equal to the field name we provided it saves the index of that field
+                if field['name'] in self.field_names:
                     indices[field['name']] = model_data['flds'].index(field)
-        if not indices:
-            raise ValueError(f"Field '{field_names}' not found.")
-        return indices
+            if indices:
+                field_indices[model_id] = indices
+            
+        # It will return the following structure:
+        # {'model_id': {'field_name': field_index, 'field_name': field_index}, 'model_id_n': ...}
+        # Basically the 'model_id' and the fields of the model, each field a pair value of name: index
+
+        if field_indices:
+            return field_indices
+        else:
+            raise Exception("Please provide valid field names")
 
     async def manipulate_fields(self, conn, cursor, file_name=""):
+        field_indices = self.get_field_indices(cursor)
         
-        # It's a dictionary {'field_name': index-number}
-        field_names = self.get_field_index(cursor, self.field_names)
-        cursor.execute("SELECT id, flds FROM notes")
+        # **id**: ID da nota.
+        # **mid**: ID do modelo de nota (relacionado à tabela `models` no campo `models` da tabela `col`).
+        # **flds**: Campos da nota, separados por `\x1f`.
+
+        cursor.execute("SELECT id, mid, flds FROM notes")
         notes = cursor.fetchall()
 
-        for note_id, flds in tqdm(notes, desc=f"Translating fields {file_name}"):
+        # Will get through all the cards in the deck, check the comment above to understand
+        for note_id, mid, flds in tqdm(notes, desc=f"Translating fields {file_name}"):
             fields = flds.split('\x1f')
-            # That crucial we need to check if the index in the list correspond to the index that we want to change
-            for field_name, index in field_names.items():
-                translated_field = await self.translate_text(fields[index])
-                fields[index] = translated_field
+            # print(note_id, mid, fields)
+            if str(mid) in field_indices:
+                # Identify the card structure them loop through field_name:index
+                for field_name, index in field_indices[str(mid)].items():
+                    translated_field = await self.translate_text(fields[index])
+                    fields[index] = translated_field
             new_flds = '\x1f'.join(fields)
             cursor.execute("UPDATE notes SET flds = ? WHERE id = ?", (new_flds, note_id))
         conn.commit()
